@@ -11,7 +11,7 @@ To prepare training data from scratch, run:
 ```shell
 python data_preparation.py
 ```
-Please unzip `data/map_data.zip` and put files `data/`
+Please unzip `data/map_data.zip` and put files under `data/map`
 
 Original data source:
 
