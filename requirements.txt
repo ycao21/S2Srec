@@ -1,0 +1,10 @@
+numpy
+scipy==1.1.0
+torchfile
+scikit-learn
+tqdm
+nltk
+simplejson
+torch
+pickle
+pytorch_pretrained_bert
