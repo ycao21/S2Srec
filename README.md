@@ -13,11 +13,6 @@ python data_preparation.py
 ```
 Please unzip `data/map_data.zip` and put files under `data/map`
 
-Original data source:
-
-* Recipe: [recipe1M](http://im2recipe.csail.mit.edu/dataset/download/) 
-* Cart: [3 Million Instacart Orders, Open Sourced](https://tech.instacart.com/3-million-instacart-orders-open-sourced-d40d29ead6f2)
-
 # Model
 To train the model:
 ```shell

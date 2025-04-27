@@ -9,8 +9,8 @@ import torch.backends.cudnn as cudnn
 
 from torch.utils.data import DataLoader
 from args import get_parser
-from model.net import ChefCart
-from model.data_loader import get_default_device, DeviceDataLoader, ingredsetDataset, recipeEmbDataset, clfDataset
+from model.net import SetPredictor
+from model.data_loader import get_default_device, DeviceDataLoader, ingredsetDataset, collate_mask_n, collate_mask_n_cpu
 import pickle
 from config import *
 
@@ -19,51 +19,61 @@ opts = parser.parse_args()
 device = get_default_device()
 
 def main():
-    print('batch size', opts.batch_size)
 
-    with open(recipeidx2ingredidx_map_path, 'rb') as f:
-        recipeidx2ingredidx_map = pickle.load(f)
-    with open(recipeidx2mainingredidx_map_path, 'rb') as f:
-        recipeidx2mainingredidx_map = pickle.load(f)
-    with open(triplet_train_set_path, 'rb') as f:
-        train_set = pickle.load(f)
-    with open(triplet_test_set_path, 'rb') as f:
-        test_set = pickle.load(f)
-    with open(emb_pretrained_path, 'rb') as f:
-        emb_pretrained = pickle.load(f)
-    # with open(clf_train_set_path, 'rb') as f:
-    #     infr_emb_set = pickle.load(f)
-    with open(clf_test_set_path, 'rb') as f:
-        clf_test_set = pickle.load(f)
+    with open('./data/recipe_title_dict.pkl', 'rb') as handle:
+        recipe_title_dict = pickle.load(handle)
 
-    # === Prepare training and validation data ===
-    print('=== Prepare training and validation data ===')
+    with open('./data/tag_recipe_list.pkl', 'rb') as handle:
+        tag_recipe_list = pickle.load(handle)
 
-    print('Perparing data loader...')
+    with open('./data/ingredient_dict_frequent.pkl', 'rb') as handle:
+        ingredient_dict = pickle.load(handle)
+    print('number of ingredient:', len(ingredient_dict))
+    ingredient_dict_reverse = {}
+    for k, v in ingredient_dict.items():
+        ingredient_dict_reverse[v] = k
+
+    with open('./data/emb_dict_frequent.pkl', 'rb') as handle:
+        emb_dict = pickle.load(handle)
+
+    with open('./data/recipe_tfidf_frequent.pkl', 'rb') as handle:
+        recipe_tfidf = pickle.load(handle)
+
+
+    # Load the training data from the text file
+    training_data_file = './data/training_data_frequent.txt'
+    training_data = []
+
+    with open(training_data_file, 'r') as f:
+        for line in f:
+            np_array = eval(line)
+            training_data.append(np_array)
+
+    print(f"Number of data points loaded: {len(training_data)}")
+
+    train_set = training_data
+
     n = len(train_set)
-    train_recipe_cart_data = [e for i, e in enumerate(train_set[:round(0.7*n)]) if i % 3 == 0]
-    train_ds = ingredsetDataset(train_recipe_cart_data, recipeidx2mainingredidx_map)
-    train_dl = DataLoader(train_ds, batch_size=opts.batch_size, shuffle=True)
+    train_recipe_cart_data = train_set[:round(0.7*n)]
+    train_ds = ingredsetDataset(train_recipe_cart_data)
+    train_dl = DataLoader(train_ds, batch_size=opts.batch_size, collate_fn=collate_mask_n,shuffle=True)
     train_dl = DeviceDataLoader(train_dl, device)
 
-    valid_recipe_cart_data = [e for i, e in enumerate(train_set[round(0.7*n):]) if i % 3 == 0]
-    valid_ds = ingredsetDataset(valid_recipe_cart_data, recipeidx2mainingredidx_map)
-    valid_dl = DataLoader(valid_ds, batch_size=opts.batch_size, shuffle=True)
+    valid_recipe_cart_data = train_set[round(0.7*n):round(0.9*n)]
+    valid_ds = ingredsetDataset(valid_recipe_cart_data)
+    valid_dl = DataLoader(valid_ds, batch_size=opts.batch_size, collate_fn=collate_mask_n, shuffle=True)
     valid_dl = DeviceDataLoader(valid_dl, device)
 
-    test_recipe_cart_data = [e for i, e in enumerate(test_set) if i % 3 == 0]
-    test_ds = ingredsetDataset(test_recipe_cart_data, recipeidx2mainingredidx_map)
-    test_dl = DataLoader(test_ds, batch_size=opts.batch_size, shuffle=True)
-    test_dl = DeviceDataLoader(test_dl, device)
+    test_recipe_cart_data = train_set[round(0.9*n):]
 
     print('Perparing pretrained embeddings...')
+    emb_pretrained = list(emb_dict.values())
     emb_pretrained_tensor = torch.tensor(emb_pretrained)
 
-    print('Initialize model parameter...')
-    model = ChefCart(emb_pretrained_tensor)
+    model = SetPredictor(emb_pretrained_tensor)
     model.to(device)
 
-    criterion = [nn.BCELoss().to(device), nn.TripletMarginLoss(margin=0.05, p=2, reduction='sum').to(device)]
+    criterion = [nn.CrossEntropyLoss(), nn.BCELoss()]
     base_params = model.parameters()
     optimizer = torch.optim.Adam([{'params': base_params}], lr=opts.lr * opts.freeRecipe)
 
@@ -77,7 +87,7 @@ def main():
 
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(opts.resume, checkpoint['epoch']))
+                .format(opts.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(opts.resume))
             best_val = float('inf')
@@ -85,21 +95,16 @@ def main():
         best_val = float('inf')
     valtrack = 0
 
-    print('There are %d parameter groups' % len(optimizer.param_groups))
-    print('Initial base params lr: %f' % optimizer.param_groups[0]['lr'])
-
-    cudnn.benchmark = True
-
-    # run epochs
     for epoch in range(opts.start_epoch, opts.epochs):
         print('=== Start training epoch {} ==='.format(epoch))
-        loss = train(train_dl, model, criterion, optimizer, epoch, opts.alpha)
+        loss = train(train_dl, model, criterion, optimizer, epoch, 0.8)
 
-        val_loss, val_acc, v_TPs, v_FPs, v_FNs, _ = valid_metrics(valid_dl, model)
-        print(' -> valid loss: {loss:.5f}\t'
-              ' valid acc: {acc:.5f}\t'
-              ' valid prec: {prec:.5f}\t'
-              ' valid recl: {recl:.5f}\t'.format(loss=val_loss.avg, acc=val_acc.avg, prec=v_TPs/(v_TPs+v_FPs), recl=v_TPs/(v_TPs+v_FNs)))
+        val_loss1, val_loss2, val_acc, v_TPs, v_FPs, v_FNs, _ = valid_metrics(valid_dl, model)
+        print(' -> valid loss1: {loss1:.5f}\t'
+            ' valid loss2: {loss2:.5f}\t'
+            ' valid acc: {acc:.5f}\t'
+            ' valid prec: {prec:.5f}\t'
+            ' valid recl: {recl:.5f}\t'.format(loss1=val_loss1.avg, loss2=val_loss2.avg, acc=val_acc.avg, prec=v_TPs/(v_TPs+v_FPs+1e-8), recl=v_TPs/(v_TPs+v_FNs+ 1e-8)))
 
         # evaluate on validation set on val freq
         if (epoch + 1) % opts.valfreq == 0 and epoch != 0:
@@ -108,7 +113,7 @@ def main():
             if val_loss >= best_val:
                 valtrack += 1
             else:
-                valtrack = 0
+                    valtrack = 0
 
             if valtrack >= opts.patience:
                 # change the learning rate accordingly
@@ -127,30 +132,10 @@ def main():
                 'curr_val': val_loss,
             }, is_best)
 
-            # print('** Validation: %f (best) - %d (valtrack)' % (best_val, valtrack))
-
-    # # save embeding
-    # print('=== Save recipe embeddings ===')
-    # print('Saving the tuned recipe embeddings...')
-    # recipe_index = list(recipeidx2mainingredidx_map.keys())[:100]
-    # recipe_ds = recipeEmbDataset(recipe_index, recipeidx2mainingredidx_map)
-    # recipe_dl = DataLoader(recipe_ds, batch_size=opts.batch_size, shuffle=False)
-    # recipe_dl = DeviceDataLoader(recipe_dl, device)
-    # save_recipe_embedding(recipe_dl, model)
-
-    # calculate test accuracy
-    test_loss, test_acc, t_TPs, t_FPs, t_FNs, pred = test_metrics(test_dl, model)
-    print(' test loss: {loss:.5f}\t'
-          ' test acc: {acc:.5f}\t'
-          ' test prec: {prec:.5f}\t'
-          ' test recl: {recl:.5f}\t'
-          ' test f1: {f1:.5f}\t'.format(loss=test_loss.avg, acc=test_acc.avg, prec=t_TPs/(t_TPs+t_FPs), 
-                                        recl=t_TPs/(t_TPs+t_FNs), f1=t_TPs/(t_TPs+(t_FPs+t_FNs)/2)))
-
-    with open('./data/output/pred.pickle', 'wb') as f:
-        pickle.dump(pred, f)
-        print('pred dumped to {}'.format(trained_recipe_emb_path))
-        
+    test_data = collate_mask_n_cpu(test_recipe_cart_data)
+    recipe_id, all_true_sets, all_pred_sets = test_metrics_n(test_data, model, max_pred=10, topk=10)
+    evaluate_stepwise_predictions(all_true_sets, all_pred_sets, topk=3, max_pred=5)
+    
 def train(train_dl, model, criterion, optimizer, epoch, alpha):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -160,33 +145,30 @@ def train(train_dl, model, criterion, optimizer, epoch, alpha):
     model.train()
     end = time.time()
     train_start = time.time()
-    for i, (ingre_set_pos, ingre_set_neg, recipe_pos, recipe_neg) in enumerate(train_dl):
+
+    # check_gpu_memory()
+    for i, (_, set_data, binary_data) in enumerate(train_dl):
         # measure data loading time
 
         data_time.update(time.time() - end)
+        # check_gpu_memory()
+        logits = model(set_data[0], set_data[1], mode='mlm')
+        loss1 = criterion[0](logits, set_data[2])
 
-        x_set = torch.cat((ingre_set_pos[0], ingre_set_neg[0]), 0)
-        x_ln = torch.cat((ingre_set_pos[1], ingre_set_neg[1]), 0)
-        y = torch.cat((ingre_set_pos[2], ingre_set_neg[2]), 0)
-        y_hat = model(x_set, x_ln, clr=1)
-        loss_BCE = criterion[0](y_hat, y)
+        y_hat = model(binary_data[0], binary_data[1], mode='clf')
+        loss2 = criterion[1](y_hat,  binary_data[2].unsqueeze(1))
 
-        recipe_anc = model(ingre_set_pos[0], ingre_set_pos[1], clr=0)
-        recipe_poc = model(recipe_pos[0], recipe_pos[1], clr=0)
-        recipe_neg = model(recipe_neg[0], recipe_neg[1], clr=0)
-        loss_triplet = criterion[1](recipe_anc, recipe_poc, recipe_neg)
-
-        loss = alpha * loss_BCE + (1 - alpha) * loss_triplet / 10
-
+        loss = alpha*loss1 + (1-alpha) * loss2
         # measure performance and record losses
-        losses.update(loss.data, ingre_set_pos[0].size(0))
-        print('  batch loss', loss.data.cpu().numpy())
+        losses.update(loss.data, set_data[0].size(0))
+        if i % 10 == 0:
+          print('  batch loss', loss.data.cpu().numpy())
 
         # compute gradient and do Adam step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
+        # check_gpu_memory()
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -199,10 +181,10 @@ def train(train_dl, model, criterion, optimizer, epoch, alpha):
 
     return loss.cpu().data.numpy()
 
-
-def valid_metrics(test_dl, model):
+def valid_metrics(valid_dl, model, criterion):
     model.eval()
-    losses = AverageMeter()
+    losses1 = AverageMeter()
+    losses2 = AverageMeter()
     accuracies = AverageMeter()
     TPs = 0
     FPs = 0
@@ -210,15 +192,22 @@ def valid_metrics(test_dl, model):
 
     x_list = []
     y_list = []
-    for i, (ingre_set_pos, ingre_set_neg, _, _) in enumerate(test_dl):
-        x_set = torch.cat((ingre_set_pos[0], ingre_set_neg[0]), 0)
-        x_ln = torch.cat((ingre_set_pos[1], ingre_set_neg[1]), 0)
-        y = torch.cat((ingre_set_pos[2], ingre_set_neg[2]), 0)
-        y_hat = model(x_set, x_ln, clr=1)
-        loss_func = nn.BCELoss()
-        loss = loss_func(y_hat, y)
+    for i, (_, set_data, binary_data) in enumerate(valid_dl):
+        # measure data loading time
+
+        # check_gpu_memory()
+        logits = model(set_data[0], set_data[1], mode='mlm')
+        loss1 = criterion[0](logits, set_data[2])
+
+        y_hat = model(binary_data[0], binary_data[1], mode='clf')
+        loss2 = criterion[1](y_hat,  binary_data[2].unsqueeze(1))
+
+        # measure performance and record losses
+        losses1.update(loss1.data, set_data[0].size(0))
+        losses2.update(loss2.data, binary_data[0].size(0))
 
         # classification accuracy
+        y = binary_data[2].unsqueeze(1)
         clf_binary = y_hat.data.cpu().numpy() > 0.5
         correct = (clf_binary == y.data.cpu().numpy()).sum()
         accuracy = correct / clf_binary.shape[0]
@@ -232,81 +221,33 @@ def valid_metrics(test_dl, model):
             elif y_hat[i] > 0.5:
                 FPs += 1
 
-        x_list.extend([ingre_set_pos[0].data.cpu().numpy(), ingre_set_neg[0].data.cpu().numpy()])
+        x_list.extend([binary_data[0].data.cpu().numpy()])
         y_list.extend([y.data.cpu().numpy(), y_hat.data.cpu().numpy(), clf_binary])
 
-        losses.update(loss.data, ingre_set_pos[0].size(0))
-        accuracies.update(accuracy, ingre_set_pos[0].size(0))
-    return losses, accuracies, TPs, FPs, FNs, [x_list, y_list]
+        # measure performance and record losses
+        losses1.update(loss1.data, set_data[0].size(0))
+        losses2.update(loss2.data, binary_data[0].size(0))
+        accuracies.update(accuracy, binary_data[0].size(0))
+    return losses1, losses2, accuracies, TPs, FPs, FNs, [x_list, y_list]
 
-def test_metrics(test_dl, model):
-    model.eval()
-    losses = AverageMeter()
-    accuracies = AverageMeter()
-    TPs = 0
-    FPs = 0
-    FNs = 0
+def save_checkpoint(state, is_best, model_name='settransformer', filename='checkpoint.pth.tar'):
+    """
+    Save model checkpoint.
 
-    x_list = []
-    y_list = []
-    for i, (ingre_set_pos, ingre_set_neg, _, _) in enumerate(test_dl):
-        x_set = torch.cat((ingre_set_pos[0], ingre_set_neg[0]), 0)
-        x_ln = torch.cat((ingre_set_pos[1], ingre_set_neg[1]), 0)
-        y = torch.cat((ingre_set_pos[2], ingre_set_neg[2]), 0)
-        y_hat = model(x_set, x_ln, clr=1)
-        loss_func = nn.BCELoss()
-        loss = loss_func(y_hat, y)
+    Args:
+        state (dict): Model state to save.
+        is_best (bool): If True, this is the best model so far.
+        model_name (str): Name of the model (for organizing different baselines).
+        filename (str): Default filename (not used if is_best is True).
+    """
+    # Customize filename with model_name, epoch, and validation score
+    filename = '/content/drive/MyDrive/data_eval/{}_e{:03d}_v{:.3f}.pth'.format(
+        model_name, state['epoch'], state['best_val']
+    )
 
-        # classification accuracy
-        clf_binary = y_hat.data.cpu().numpy() > 0.5
-        correct = (clf_binary == y.data.cpu().numpy()).sum()
-        accuracy = correct / clf_binary.shape[0]
-
-        for i in range(len(y)):
-            if y[i] == 1:
-                if y_hat[i] > 0.5:
-                    TPs += 1
-                else:
-                    FNs += 1
-            elif y_hat[i] > 0.5:
-                FPs += 1
-
-        x_list.extend([x_set, x_set[0].data.cpu().numpy()])
-        y_list.extend([y.data.cpu().numpy(), y_hat.data.cpu().numpy(), clf_binary])
-
-        losses.update(loss.data, ingre_set_pos[0].size(0))
-        accuracies.update(accuracy, ingre_set_pos[0].size(0))
-
-    return losses, accuracies, TPs, FPs, FNs, [x_list, y_list]
-
-
-# save recipe embeddings
-def save_recipe_embedding(data_loader, model):
-    # switch to evaluate mode
-    model.eval()
-
-    recipe_emb_dict = {}
-    print('start save the tuned embeddings')
-    for i, recipe in enumerate(data_loader):
-        output = model(recipe[1], recipe[2], clr=0).data.cpu().numpy()
-
-        recipe_idx = recipe[0].data.cpu().numpy()
-        recipe_dict = {}
-        for i in range(len(output)):
-            recipe_emb = output[i]
-            recipe_dict[recipe_idx[i]] = recipe_emb
-        recipe_emb_dict.update(recipe_dict)
-
-    with open(trained_recipe_emb_path, 'wb') as f:
-        pickle.dump(recipe_emb_dict, f)
-        print('trained_recipe_emb dumped to {}'.format(trained_recipe_emb_path))
-    return
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    filename = opts.snapshots + 'model_e%03d_v-%.3f.pth' % (state['epoch'], state['best_val'])
     if is_best:
         torch.save(state, filename)
-        print('save checkpoint %s' % filename)
+        print('Saved checkpoint: {}'.format(filename))
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -332,6 +273,125 @@ def adjust_learning_rate(optimizer, epoch, opts):
     print('Initial base params lr: %f' % optimizer.param_groups[0]['lr'])
     # after first modality change we set patience to 3
     opts.patience = 3
+
+
+def evaluate_stepwise_predictions(true_sets, pred_stepwise, max_pred=5, topk=10):
+    """
+    Evaluate stepwise predictions using:
+    - Cumulative Recall@k (union of top-k across all steps)
+    - Final Recall@k (based on top-1 from each step)
+    - Top-k Success Rate (any step has hit in top-k)
+
+    Args:
+        true_sets: List[Set[int]]
+        pred_stepwise: List[List[Set[int]]] — per-step top-k predictions
+        k: int — top-k to evaluate for step-level success and cumulative recall
+
+    Returns:
+        Dict with averaged metrics
+    """
+    cumulative_recall_list = []
+    final_recall_list = []
+    success_list = []
+    true_lengths = []
+    pred_lengths = []
+
+    for gt, step_preds_raw in zip(true_sets, pred_stepwise):
+        # print(gt)
+        step_preds = step_preds_raw[:max_pred].copy()
+        # print(step_preds)
+        flat_preds = []
+        # step_success = False
+        top1_per_step = []
+
+        for i in range(len(step_preds[0])):
+            for s in step_preds:
+                # print(s)
+                if s[i] not in flat_preds:
+                  flat_preds.append(s[i])
+        # print(flat_preds)
+
+        top1_per_step = flat_preds[:max_pred]
+        # flat_preds = set(flat_preds[:topk])
+        flat_preds = set(step_preds[0][:topk])
+        final_preds = set(top1_per_step)
+        # print('final_preds', final_preds)
+
+
+        cumulative_recall = len(flat_preds & gt) / len(gt) if gt else 0.0
+        final_recall = len(final_preds & gt) / len(gt) if gt else 0.0
+
+        cumulative_recall_list.append(cumulative_recall)
+        final_recall_list.append(final_recall)
+        # success_list.append(1.0 if step_success else 0.0)
+
+        true_lengths.append(len(gt))
+        pred_lengths.append(len(step_preds))
+
+
+    print("=== Stepwise Model ===")
+    print("Cumulative Recall@{}: {:.4f}".format(topk, np.mean(cumulative_recall_list)))
+    print("Final Recall (Top-1 per step): {:.4f}".format(np.mean(final_recall_list)))
+    # print("Top-{} Success Rate: {:.4f}".format(topk, np.mean(success_list)))
+    print("MSE of Set Length: {:.4f}".format(np.mean((np.array(true_lengths) - np.array(pred_lengths)) ** 2)))
+
+    return    
+
+from tqdm import tqdm
+
+def test_metrics_n(test_data, model, max_pred=10, topk=1):
+    model.eval()
+    with torch.no_grad():
+
+        all_true_sets = []
+        all_pred_sets = []
+        recipe_id = []
+        sims_list = []
+        for i, data in tqdm(enumerate(test_data)):
+            initial_ingredients = data[1][0]
+            target = data[1][2]
+            set_pred = []
+
+            current_seq = initial_ingredients.copy()
+            for step in range(max_pred):
+                # Append the mask token to indicate we want to predict the next ingredient.
+                input_seq = pad_set(current_seq, 0, 45)
+                input_tensor = torch.tensor([input_seq], dtype=torch.long, device=device)
+                seq_lengths = torch.tensor([len(input_seq)], dtype=torch.long, device=device)
+
+                logits = model(input_tensor, seq_lengths, mode='mlm')  # shape [1, seq_len, vocab_size]
+
+                # Extract the logits corresponding to the masked position (last position).
+
+                next_logits = logits
+                # Greedy decode: select the token with maximum probability.
+                next_id_list = torch.topk(next_logits, 50).indices.cpu().numpy()[0]
+                next_id_list_filtered = [i for i in next_id_list if i not in current_seq]
+
+                if len(next_id_list_filtered) > 0:
+                    next_id = [int(i) for i in next_id_list_filtered]
+                    set_pred.append(next_id[:topk])
+                    # set_pred.extend(next_id_list_filtered[:topk])
+                else:
+                    set_pred.append([0])
+
+                # Otherwise, add the predicted ingredient to the sequence.
+                current_seq.append(next_id[0])
+                # print('Current step output:', current_seq , '\n')
+
+                # If the model predicts <STOP>, break.
+                stop_binary = model(input_tensor, seq_lengths, mode='clf').data.cpu().numpy()
+                # print(stop_binary)
+                if stop_binary > 0.5:
+                    break
+
+            all_true_sets.append(set(target))
+            if len(set_pred) == 0:
+                set_pred.append([0])
+            all_pred_sets.append(set_pred)
+            recipe_id.append(data[0])
+
+    return recipe_id, all_true_sets, all_pred_sets
 
 if __name__ == '__main__':
     main()
